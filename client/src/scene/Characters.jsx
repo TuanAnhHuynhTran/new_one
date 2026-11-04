@@ -62,7 +62,7 @@ export function Avatar({ anim, shirt = '#5aa9e6', pants = '#3f4c6b', hair = '#6b
 }
 
 // Chú chó Mochi. Có player → đi theo; không có → đứng tại chỗ vẫy đuôi (dùng ở màn đăng nhập).
-export function Puppy({ player, feedTick = 0, position = [0, 0, 0], rotation = 0 }) {
+export function Puppy({ player, feedTick = 0, position = [0, 0, 0], rotation = 0, bounds }) {
   const root = useRef(), body = useRef(), tail = useRef(), head = useRef(), legs = useRef([]);
   const state = useRef({ init: false, hop: 0, phase: 0, yaw: rotation });
   const [hearts, setHearts] = useState(false);
@@ -79,7 +79,11 @@ export function Puppy({ player, feedTick = 0, position = [0, 0, 0], rotation = 0
     let moving = false;
     if (player) {
       const p = player.current;
-      const tx = p.x + 1.3, tz = p.z + 1.5;
+      // Đi bên cạnh (phía tay phải, lùi nửa bước) để không chắn camera ở góc nhìn thứ 3.
+      const fa = p.angle || 0, fx = Math.sin(fa), fz = Math.cos(fa);
+      let tx = p.x - fz * 1.4 - fx * 0.5, tz = p.z + fx * 1.4 - fz * 0.5;
+      // Trong phòng: giữ Mochi trong sàn nhà (đứng phía bên kia nếu sát tường).
+      if (bounds) { if (tx > bounds.x1 || tx < bounds.x0) tx = 2 * p.x - tx; if (tz > bounds.z1 || tz < bounds.z0) tz = 2 * p.z - tz; tx = Math.max(bounds.x0, Math.min(bounds.x1, tx)); tz = Math.max(bounds.z0, Math.min(bounds.z1, tz)); }
       if (!s.init) { g.position.set(tx, 0, tz); s.init = true; }
       const dx = tx - g.position.x, dz = tz - g.position.z, d = Math.hypot(dx, dz);
       if (d > 1.2) {

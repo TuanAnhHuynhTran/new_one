@@ -6,6 +6,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
+import { gardenInfo } from './store/common.js';
 dotenv.config();
 
 const {
@@ -98,6 +99,65 @@ app.delete('/api/house/furniture/:id', auth, wrap(async (req, res) => {
   if (!Number.isSafeInteger(id) || id <= 0) return res.status(400).json({ error: 'ID không hợp lệ' });
   if (!(await store.deleteFurniture(req.userId, id))) return res.status(404).json({ error: 'Không thấy vật phẩm' });
   res.json({ ok: true });
+}));
+
+// ---------- Sân vườn ----------
+const GARDEN_ERRORS = {
+  NO_HOUSE: [404, 'Không có nhà'], NOT_FOUND: [404, 'Không thấy khu vườn này'],
+  SIZE: [400, 'Kích thước không hợp lệ'], KIND: [400, 'Loại khu không hợp lệ'],
+  OUT: [409, 'Khu này nằm ngoài sân vườn'], OVERLAP: [409, 'Chỗ này đã có khu khác'],
+  PLOTS: [409, 'Hãy dọn bớt luống / hồ ở mép vườn trước khi thu nhỏ'], LIMIT: [409, 'Vườn chỉ chứa tối đa 30 khu'],
+  NOT_BED: [400, 'Chỉ gieo hạt được trên luống rau'], NO_CROP: [400, 'Hạt giống không hợp lệ'], BUSY: [409, 'Luống đã có cây'],
+  EMPTY: [409, 'Luống đang trống'], NOT_RIPE: [409, 'Cây chưa chín'],
+  NOT_POND: [400, 'Chỉ thả cá được vào hồ'], NO_FISH: [400, 'Loại cá không hợp lệ'], FULL: [409, 'Hồ đã đầy cá'],
+};
+const gardenReply = (res, r, status = 200) => {
+  if (r && r.error) { const [code, msg] = GARDEN_ERRORS[r.error] || [400, 'Không hợp lệ']; return res.status(code).json({ error: msg, code: r.error }); }
+  res.status(status).json(r);
+};
+const plotId = req => { const id = Number(req.params.id); return Number.isSafeInteger(id) && id > 0 ? id : null; };
+const isNum = n => typeof n === 'number' && Number.isFinite(n);
+
+app.get('/api/garden', auth, wrap(async (req, res) => {
+  const g = await store.getGarden(req.userId);
+  if (!g) return res.status(404).json({ error: 'Không có nhà' });
+  res.json({ ...g, ...gardenInfo, serverTime: new Date().toISOString() });
+}));
+app.put('/api/garden', auth, wrap(async (req, res) => {
+  const { width, depth } = req.body;
+  if (!isNum(width) || !isNum(depth)) return res.status(400).json({ error: 'Kích thước không hợp lệ' });
+  gardenReply(res, await store.resizeGarden(req.userId, width, depth));
+}));
+app.post('/api/garden/plots', auth, wrap(async (req, res) => {
+  const { kind, x, z, w, d } = req.body;
+  if (typeof kind !== 'string' || ![x, z, w, d].every(isNum)) return res.status(400).json({ error: 'Dữ liệu không hợp lệ' });
+  gardenReply(res, await store.addPlot(req.userId, { kind, x, z, w, d }), 201);
+}));
+app.put('/api/garden/plots/:id', auth, wrap(async (req, res) => {
+  const id = plotId(req), { x, z, w, d } = req.body;
+  if (!id || ![x, z, w, d].every(isNum)) return res.status(400).json({ error: 'Dữ liệu không hợp lệ' });
+  gardenReply(res, await store.movePlot(req.userId, id, { x, z, w, d }));
+}));
+app.delete('/api/garden/plots/:id', auth, wrap(async (req, res) => {
+  const id = plotId(req);
+  if (!id) return res.status(400).json({ error: 'ID không hợp lệ' });
+  if (!(await store.deletePlot(req.userId, id))) return res.status(404).json({ error: 'Không thấy khu vườn này' });
+  res.json({ ok: true });
+}));
+app.post('/api/garden/plots/:id/plant', auth, wrap(async (req, res) => {
+  const id = plotId(req);
+  if (!id || typeof req.body.crop !== 'string') return res.status(400).json({ error: 'Dữ liệu không hợp lệ' });
+  gardenReply(res, await store.plantPlot(req.userId, id, req.body.crop));
+}));
+app.post('/api/garden/plots/:id/harvest', auth, wrap(async (req, res) => {
+  const id = plotId(req);
+  if (!id) return res.status(400).json({ error: 'ID không hợp lệ' });
+  gardenReply(res, await store.harvestPlot(req.userId, id));
+}));
+app.post('/api/garden/plots/:id/fish', auth, wrap(async (req, res) => {
+  const id = plotId(req);
+  if (!id || typeof req.body.species !== 'string') return res.status(400).json({ error: 'Dữ liệu không hợp lệ' });
+  gardenReply(res, await store.addFish(req.userId, id, req.body.species));
 }));
 
 app.post('/api/pet/feed', auth, wrap(async (req, res) => {

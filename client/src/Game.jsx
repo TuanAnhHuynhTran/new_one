@@ -1,15 +1,15 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
-import { OrbitControls } from '@react-three/drei';
 import * as THREE from 'three';
 import { MAP, defaultPlots, skyColors, sunState } from './world.js';
 import { buildColliders } from './scene/colliders.js';
-import { Mat, TimeCtx, occluders } from './scene/kit.jsx';
+import { Mat, TimeCtx, lerpFov, makeFader } from './scene/kit.jsx';
 import { Balloons, Clouds, SkyDome, Stars, SunMoon, Trees, buildNature } from './scene/Nature.jsx';
 import { Cafe, Cars, CityBuilding, CityGround, StreetLamps, cityLampSpots } from './scene/City.jsx';
 import { Farmstead, RuralDecor, RuralGround } from './scene/Rural.jsx';
 import { Avatar, Puppy, hairColor, shirtColor } from './scene/Characters.jsx';
 import { Interior } from './scene/Interior.jsx';
+import { Garden } from './scene/Garden.jsx';
 
 // ---------- Ánh sáng ----------
 function WorldLights({ player, level, night }) {
@@ -58,30 +58,21 @@ function InteriorLights({ night }) {
 const keys = {};
 // Góc camera mặc định (offset 9, 12, 14 so với nhân vật).
 const CAM_BASE_YAW = Math.atan2(9, 14), CAM_DIST = Math.hypot(9, 12, 14), CAM_PITCH = Math.atan2(12, Math.hypot(9, 14));
-const camRay = new THREE.Raycaster(), camHead = new THREE.Vector3(), camWant = new THREE.Vector3(), camDir = new THREE.Vector3();
+const camHead = new THREE.Vector3(), camWant = new THREE.Vector3();
+const groundRay = new THREE.Raycaster(), groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), groundHit = new THREE.Vector3();
 
-// Bật/tắt chế độ mờ cho toàn bộ vật liệu trong một khối nhà (lưu lại giá trị gốc để khôi phục).
-function setFade(root, on) {
-  root.traverse(m => {
-    if (!m.isMesh) return;
-    (Array.isArray(m.material) ? m.material : [m.material]).forEach(mt => {
-      if (on && !mt.userData.fade) {
-        mt.userData.fade = { t: mt.transparent, o: mt.opacity, d: mt.depthWrite };
-        mt.transparent = true; mt.opacity = 0.18 * mt.opacity; mt.depthWrite = false; mt.needsUpdate = true;
-      } else if (!on && mt.userData.fade) {
-        const f = mt.userData.fade;
-        mt.transparent = f.t; mt.opacity = f.o; mt.depthWrite = f.d; mt.needsUpdate = true;
-        delete mt.userData.fade;
-      }
-    });
-  });
-}
-function PlayerController({ me, player, anim, hit, onMove }) {
+// Góc nhìn thứ 3: camera thấp sau lưng nhân vật.
+const TP = { dist: 6.2, pitch: 0.28, fov: 58, isoFov: 45 };
+function PlayerController({ me, player, anim, hit, onMove, view }) {
   const group = useRef();
   const zoom = useRef(1);
   // Góc xoay camera do người chơi kéo chuột phải; giữ trong player ref để không mất khi ra/vào nhà.
   if (player.current.yaw == null) { player.current.yaw = 0; player.current.pitch = CAM_PITCH; }
-  const faded = useRef(new Set());
+  const fader = useMemo(() => makeFader(), []);
+  const dragRef = useRef(false);
+  const vel = useRef({ x: 0, z: 0 });
+  const mouse = useRef({ held: false, since: 0, ndc: new THREE.Vector2(), target: null });
+  const marker = useRef();
   const { camera, gl } = useThree();
   useEffect(() => {
     // Chỉ lấy vị trí đã lưu ở lần đầu; khi ra/vào nhà, nhân vật giữ nguyên vị trí hiện tại.
@@ -99,17 +90,41 @@ function PlayerController({ me, player, anim, hit, onMove }) {
     const up = e => { keys[e.code] = false; };
     const blur = () => Object.keys(keys).forEach(k => delete keys[k]);
     const wheel = e => { e.preventDefault(); zoom.current = THREE.MathUtils.clamp(zoom.current * (e.deltaY > 0 ? 1.1 : 0.9), 0.55, 1.7); };
-    // Giữ chuột phải và kéo để xoay camera quanh nhân vật.
+    // Chuột phải + kéo: xoay camera. Chuột trái: giữ để đi theo con trỏ, click để đi tới điểm đó.
     const el = gl.domElement;
     let dragging = false;
-    const pdown = e => { if (e.button !== 2) return; dragging = true; el.setPointerCapture(e.pointerId); el.style.cursor = 'grabbing'; };
-    const pmove = e => {
-      if (!dragging) return;
-      const p = player.current;
-      p.yaw -= e.movementX * 0.006;
-      p.pitch = THREE.MathUtils.clamp(p.pitch + e.movementY * 0.004, 0.22, 1.25);
+    const m = mouse.current;
+    const setNdc = e => { const r = el.getBoundingClientRect(); m.ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1); };
+    const pdown = e => {
+      if (e.button === 2) { dragging = true; dragRef.current = true; el.setPointerCapture(e.pointerId); el.style.cursor = 'grabbing'; return; }
+      if (e.button !== 0) return;
+      el.setPointerCapture(e.pointerId);
+      setNdc(e);
+      m.held = true; m.since = performance.now();
     };
-    const pup = e => { if (e.button !== 2 || !dragging) return; dragging = false; el.releasePointerCapture?.(e.pointerId); el.style.cursor = ''; };
+    const pmove = e => {
+      if (m.held) setNdc(e);
+      if (!dragging) return;
+      const p = player.current, vw = view.current;
+      if (vw.tp) {
+        vw.wYaw -= e.movementX * 0.006;
+        vw.wPitch = THREE.MathUtils.clamp(vw.wPitch + e.movementY * 0.004, -0.05, 1.1);
+      } else {
+        p.yaw -= e.movementX * 0.006;
+        p.pitch = THREE.MathUtils.clamp(p.pitch + e.movementY * 0.004, 0.22, 1.25);
+      }
+    };
+    const pup = e => {
+      if (e.button === 0 && m.held) {
+        m.held = false;
+        el.releasePointerCapture?.(e.pointerId);
+        // Click nhanh → giữ lại điểm đích để nhân vật tự đi tới; giữ lâu → dừng khi thả chuột.
+        if (performance.now() - m.since > 250) m.target = null;
+        return;
+      }
+      if (e.button !== 2 || !dragging) return;
+      dragging = false; dragRef.current = false; el.releasePointerCapture?.(e.pointerId); el.style.cursor = '';
+    };
     const ctx = e => e.preventDefault();
     window.addEventListener('keydown', down); window.addEventListener('keyup', up); window.addEventListener('blur', blur);
     el.addEventListener('wheel', wheel, { passive: false });
@@ -123,71 +138,166 @@ function PlayerController({ me, player, anim, hit, onMove }) {
     };
   }, [gl, player]);
   useFrame((_, rawDt) => {
-    const dt = Math.min(rawDt, 0.06), p = player.current;
-    const dx = Number(!!(keys.KeyD || keys.ArrowRight)) - Number(!!(keys.KeyA || keys.ArrowLeft));
-    const dz = Number(!!(keys.KeyS || keys.ArrowDown)) - Number(!!(keys.KeyW || keys.ArrowUp));
-    const len = Math.hypot(dx, dz);
-    const run = !!(keys.ShiftLeft || keys.ShiftRight);
-    anim.current.moving = false; anim.current.run = run;
-    if (len) {
-      const sp = (run ? 9 : 5) * dt;
+    const dt = Math.min(rawDt, 0.06), p = player.current, m = mouse.current, v = vel.current, vw = view.current;
+    if (vw.wYaw == null) { vw.wYaw = CAM_BASE_YAW + p.yaw; vw.wPitch = TP.pitch; }
+    // Hướng phím theo camera: góc nhìn trên cao xoay theo p.yaw, góc nhìn thứ 3 theo đúng hướng camera (W = tiến về phía trước).
+    const rot = vw.tp ? vw.wYaw : p.yaw;
+    const c = Math.cos(rot), s = Math.sin(rot);
+    // ---- 1. Hướng muốn đi (wx, wz), độ lớn 0..1 ----
+    let wx = 0, wz = 0, run = !!(keys.ShiftLeft || keys.ShiftRight);
+    const kx = Number(!!(keys.KeyD || keys.ArrowRight)) - Number(!!(keys.KeyA || keys.ArrowLeft));
+    const kz = Number(!!(keys.KeyS || keys.ArrowDown)) - Number(!!(keys.KeyW || keys.ArrowUp));
+    const pad = navigator.getGamepads?.()[0];
+    let ax = 0, az = 0;
+    if (pad) {
+      ax = pad.axes[0] || 0; az = pad.axes[1] || 0;
+      const mag = Math.hypot(ax, az);
+      if (mag < 0.18) { ax = 0; az = 0; } else { const k = Math.min(1, (mag - 0.18) / 0.82) / mag; ax *= k; az *= k; }
+      if (Math.hypot(ax, az) > 0.92 || pad.buttons[10]?.pressed) run = true;
+    }
+    const ix = kx + ax, iz = kz + az;
+    if (ix || iz) {
+      // Phím / cần analog: xoay theo góc camera (W luôn là "đi ra xa camera").
+      const l = Math.max(1, Math.hypot(ix, iz));
+      wx = (ix * c + iz * s) / l; wz = (iz * c - ix * s) / l;
+      m.target = null;
+    } else {
+      // Chuột trái: lấy điểm trên mặt đất dưới con trỏ.
+      if (m.held) {
+        groundRay.setFromCamera(m.ndc, camera);
+        if (groundRay.ray.intersectPlane(groundPlane, groundHit)) m.target = { x: groundHit.x, z: groundHit.z, t: 0 };
+      }
+      if (m.target) {
+        const tx = m.target.x - p.x, tz = m.target.z - p.z, dist = Math.hypot(tx, tz);
+        if (dist < 0.25) m.target = null;
+        else {
+          // Giảm tốc khi gần tới đích, chạy khi điểm đích ở xa.
+          const k = Math.min(1, dist / 1.2) / dist;
+          wx = tx * k; wz = tz * k;
+          if (dist > 12) run = true;
+        }
+      }
+    }
+    // ---- 2. Vận tốc có quán tính: tăng/giảm tốc mượt, đổi hướng theo đường cong ----
+    const maxSp = run ? 9 : 5;
+    const accel = (wx || wz) ? 14 : 18;
+    v.x += (wx * maxSp - v.x) * Math.min(1, accel * dt);
+    v.z += (wz * maxSp - v.z) * Math.min(1, accel * dt);
+    const speed = Math.hypot(v.x, v.z);
+    if (speed < 0.05) { v.x = 0; v.z = 0; }
+    anim.current.run = run && speed > 6;
+    anim.current.moving = speed > 0.4;
+    if (speed > 0.05) {
       const { x0, x1, z0, z1 } = MAP.bounds;
-      // Hướng phím tính theo góc camera hiện tại (W luôn là "đi ra xa camera").
-      const c = Math.cos(p.yaw), s = Math.sin(p.yaw);
-      const mx = (dx * c + dz * s) / len, mz = (dz * c - dx * s) / len;
-      const nx = THREE.MathUtils.clamp(p.x + mx * sp, x0, x1), nz = THREE.MathUtils.clamp(p.z + mz * sp, z0, z1);
+      const nx = THREE.MathUtils.clamp(p.x + v.x * dt, x0, x1), nz = THREE.MathUtils.clamp(p.z + v.z * dt, z0, z1);
       // Nếu đang kẹt sẵn trong vật cản (vị trí lưu cũ) thì cho đi tự do để thoát ra.
       const stuck = hit(p.x, p.z);
       const ok = (x, z) => stuck || !hit(x, z);
-      // Trượt dọc vật cản: thử cả hai trục, rồi từng trục riêng.
-      if (ok(nx, nz)) { p.x = nx; p.z = nz; } else if (ok(nx, p.z)) p.x = nx; else if (ok(p.x, nz)) p.z = nz;
-      const target = Math.atan2(mx, mz);
+      const ox = p.x, oz = p.z;
+      // Trượt dọc vật cản: thử cả hai trục, rồi từng trục riêng (mất vận tốc theo trục bị chặn).
+      if (ok(nx, nz)) { p.x = nx; p.z = nz; }
+      else if (ok(nx, p.z)) { p.x = nx; v.z *= 0.2; }
+      else if (ok(p.x, nz)) { p.z = nz; v.x *= 0.2; }
+      else { v.x *= 0.2; v.z *= 0.2; }
+      // Đi bằng click mà bị kẹt quá lâu thì bỏ điểm đích.
+      if (m.target && !m.held) { m.target.t = Math.hypot(p.x - ox, p.z - oz) < 0.01 ? m.target.t + dt : 0; if (m.target.t > 0.4) m.target = null; }
+      const target = Math.atan2(v.x, v.z);
       let diff = target - p.angle; diff = Math.atan2(Math.sin(diff), Math.cos(diff));
-      p.angle += diff * Math.min(1, dt * 14);
-      anim.current.moving = true;
+      p.angle += diff * Math.min(1, dt * 12);
       onMove?.(p);
+    }
+    // Vòng đánh dấu điểm click.
+    if (marker.current) {
+      const show = !!m.target && !m.held;
+      marker.current.visible = show;
+      if (show) { marker.current.position.set(m.target.x, 0.06, m.target.z); marker.current.scale.setScalar(1 + Math.sin(performance.now() / 160) * 0.12); }
     }
     group.current?.position.set(p.x, 0, p.z);
     if (group.current) group.current.rotation.y = p.angle;
-    const d = CAM_DIST * zoom.current, th = CAM_BASE_YAW + p.yaw;
-    const hh = Math.cos(p.pitch) * d;
-    camWant.set(p.x + Math.sin(th) * hh, 1.6 + Math.sin(p.pitch) * d, p.z + Math.cos(th) * hh);
-    camera.position.lerp(camWant, Math.min(dt * 6, 1));
-    camera.lookAt(p.x, 1.2, p.z);
-    // Nhà cửa chắn giữa camera và nhân vật thì làm mờ đi để luôn nhìn thấy nhân vật.
-    camHead.set(p.x, 1.4, p.z);
-    camDir.subVectors(camera.position, camHead);
-    camRay.set(camHead, camDir.normalize());
-    camRay.far = camHead.distanceTo(camera.position);
-    const now = new Set();
-    for (const h of camRay.intersectObjects([...occluders], true)) {
-      let o = h.object;
-      while (o && !occluders.has(o)) o = o.parent;
-      if (o) now.add(o);
+    if (vw.tp) {
+      // ---- Góc nhìn thứ 3: camera tự xoay về sau lưng khi nhân vật tiến lên / đi bằng chuột ----
+      const forward = kz < 0 || az < -0.3 || (!!m.target && !m.held);
+      if (!dragRef.current && speed > 1 && forward) {
+        let diff = p.angle + Math.PI - vw.wYaw; diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+        vw.wYaw += diff * Math.min(1, dt * 1.8);
+      }
+      const d = TP.dist * zoom.current, hh = Math.cos(vw.wPitch) * d;
+      camWant.set(p.x + Math.sin(vw.wYaw) * hh, Math.max(0.5, 1.9 + Math.sin(vw.wPitch) * d), p.z + Math.cos(vw.wYaw) * hh);
+      camera.position.lerp(camWant, Math.min(dt * 8, 1));
+      camera.lookAt(p.x, 1.75, p.z);
+      lerpFov(camera, TP.fov, dt);
+    } else {
+      const d = CAM_DIST * zoom.current, th = CAM_BASE_YAW + p.yaw;
+      const hh = Math.cos(p.pitch) * d;
+      camWant.set(p.x + Math.sin(th) * hh, 1.6 + Math.sin(p.pitch) * d, p.z + Math.cos(th) * hh);
+      camera.position.lerp(camWant, Math.min(dt * 6, 1));
+      camera.lookAt(p.x, 1.2, p.z);
+      lerpFov(camera, TP.isoFov, dt);
     }
-    faded.current.forEach(o => { if (!now.has(o)) { setFade(o, false); faded.current.delete(o); } });
-    now.forEach(o => { if (!faded.current.has(o)) { setFade(o, true); faded.current.add(o); } });
+    // Nhà cửa chắn giữa camera và nhân vật thì làm mờ đi để luôn nhìn thấy nhân vật.
+    fader.update(camera, camHead.set(p.x, 1.4, p.z));
   });
-  useEffect(() => () => { faded.current.forEach(o => setFade(o, false)); faded.current.clear(); }, []);
+  useEffect(() => () => fader.clear(), [fader]);
   return (
-    <group ref={group}>
-      <Avatar anim={anim} shirt={shirtColor(me?.id)} hair={hairColor(me?.id)} name={me?.display_name} />
-    </group>
+    <>
+      <group ref={group}>
+        <Avatar anim={anim} shirt={shirtColor(me?.id)} hair={hairColor(me?.id)} name={me?.display_name} />
+      </group>
+      <mesh ref={marker} rotation={[-Math.PI / 2, 0, 0]} visible={false}>
+        <ringGeometry args={[0.35, 0.55, 28]} />
+        <meshBasicMaterial color="#ffffff" transparent opacity={0.85} depthWrite={false} />
+      </mesh>
+    </>
   );
 }
 
-function InteriorCamera() {
-  const { camera } = useThree();
-  useEffect(() => { camera.position.set(10, 9.5, 11); camera.lookAt(0, 1, 0); }, [camera]);
-  return (
-    <OrbitControls makeDefault target={[0, 1, 0]} enablePan={false} minDistance={9} maxDistance={20}
-      minPolarAngle={0.45} maxPolarAngle={1.25} minAzimuthAngle={0.12} maxAzimuthAngle={1.45} enableDamping
-      mouseButtons={{ LEFT: null, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE }} />
-  );
+// Camera trong nhà / sân vườn: góc diorama (cố định, hoặc đi theo nhân vật nếu follow), hoặc góc nhìn thứ 3 sau lưng. Cuộn chuột để zoom.
+function InteriorCamera({ view, roomPlayer, follow = false }) {
+  const { camera, gl } = useThree();
+  const zoom = useRef(1);
+  const fader = useMemo(() => makeFader(), []);
+  useEffect(() => () => fader.clear(), [fader]);
+  useEffect(() => {
+    const wheel = e => { e.preventDefault(); zoom.current = THREE.MathUtils.clamp(zoom.current * (e.deltaY > 0 ? 1.08 : 0.92), 0.7, 1.4); };
+    gl.domElement.addEventListener('wheel', wheel, { passive: false });
+    camera.position.set(10, 9.5, 11);
+    return () => gl.domElement.removeEventListener('wheel', wheel);
+  }, [camera, gl]);
+  useFrame((_, rawDt) => {
+    const dt = Math.min(rawDt, 0.06), z = zoom.current, vw = view.current, p = roomPlayer.current;
+    if (vw.tp) {
+      if (vw.rYaw == null) { vw.rYaw = p.angle + Math.PI; vw.rPitch = 0.42; }
+      // Khi tiến lên, camera từ từ quay về sau lưng nhân vật.
+      if (p.forward && p.speed > 0.5) {
+        let diff = p.angle + Math.PI - vw.rYaw; diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+        vw.rYaw += diff * Math.min(1, dt * 2.2);
+      }
+      const d = (follow ? 5.4 : 4.6) * z, hh = Math.cos(vw.rPitch) * d;
+      camWant.set(p.x + Math.sin(vw.rYaw) * hh, 1.7 + Math.sin(vw.rPitch) * d, p.z + Math.cos(vw.rYaw) * hh);
+      camera.position.lerp(camWant, Math.min(1, dt * 8));
+      camera.lookAt(p.x, 1.25, p.z);
+      lerpFov(camera, 62, dt);
+      fader.update(camera, camHead.set(p.x, 1.3, p.z));
+    } else if (follow) {
+      // Nhìn vào điểm hơi lệch về phía camera để nhân vật nằm cao hơn thanh công cụ ở dưới màn hình.
+      camWant.set(p.x + 1 + 6.5 * z, 0.6 + 8.5 * z, p.z + 2.4 + 9.5 * z);
+      camera.position.lerp(camWant, Math.min(1, dt * 5));
+      camera.lookAt(camera.position.x - 6.5 * z, 0.6, camera.position.z - 9.5 * z);
+      lerpFov(camera, TP.isoFov, dt);
+      fader.clear();
+    } else {
+      camWant.set(10 * z, 1 + 8.5 * z, 11 * z);
+      camera.position.lerp(camWant, Math.min(1, dt * 6));
+      camera.lookAt(0, 0.8, 0);
+      lerpFov(camera, TP.isoFov, dt);
+      fader.clear();
+    }
+  });
+  return null;
 }
 
 // ---------- Thế giới ngoài trời ----------
-function World({ me, nodes, trees, player, anim, hit, onPosition, feedTick, night }) {
+function World({ me, nodes, trees, player, anim, hit, onPosition, feedTick, night, view }) {
   const lampSpots = useMemo(() => cityLampSpots(), []);
   const ownerPlot = me?.plot_id;
   return (
@@ -205,15 +315,19 @@ function World({ me, nodes, trees, player, anim, hit, onPosition, feedTick, nigh
       <Cars player={player} />
       <Clouds night={night} />
       <Balloons />
-      <PlayerController me={me} player={player} anim={anim} hit={hit} onMove={onPosition} />
+      <PlayerController me={me} player={player} anim={anim} hit={hit} onMove={onPosition} view={view} />
       <Puppy player={player} feedTick={feedTick} />
     </>
   );
 }
 
-export default function Game({ me, plots, mode, furniture, held, rotation, onPlace, onPick, onPosition, feedTick }) {
+export default function Game({ me, plots, mode, furniture, held, rotation, onPlace, onPick, onRotateHeld, onRotateItem, onTarget, onBlocked, onPosition, feedTick, thirdPerson, garden }) {
   const player = useRef({ x: 0, z: 0, angle: 0 });
   const anim = useRef({ moving: false, run: false });
+  // Trạng thái camera dùng chung: tp = góc nhìn thứ 3; wYaw/wPitch ngoài trời, rYaw/rPitch trong nhà.
+  const view = useRef({ tp: thirdPerson, wYaw: null, wPitch: 0.28, rYaw: null, rPitch: 0.32 });
+  view.current.tp = thirdPerson;
+  const roomPlayer = useRef({ x: 0, z: 3, angle: Math.PI, speed: 0, forward: false });
   const [sun, setSun] = useState(() => sunState());
   useEffect(() => { const i = setInterval(() => setSun(sunState()), 30000); return () => clearInterval(i); }, []);
   const nodes = useMemo(() => (plots.length ? plots : defaultPlots()), [plots]);
@@ -225,7 +339,18 @@ export default function Game({ me, plots, mode, furniture, held, rotation, onPla
   return (
     <Canvas shadows="soft" dpr={[1, 1.75]} camera={{ fov: 45, position: [10, 12, 16], near: 0.1, far: 900 }} gl={{ antialias: true }}>
       <TimeCtx.Provider value={time}>
-        {world ? (
+        {mode === 'garden' && garden ? (
+          <>
+            <color attach="background" args={[sky.bottom]} />
+            <fog attach="fog" args={[sky.bottom, 40, 120]} />
+            <SkyDome top={sky.top} bottom={sky.bottom} />
+            <Stars night={sun.night} />
+            <SunMoon night={sun.night} />
+            <WorldLights player={roomPlayer} level={sun.level} night={sun.night} />
+            <Garden me={me} view={view} player={roomPlayer} {...garden} />
+            <InteriorCamera view={view} roomPlayer={roomPlayer} follow />
+          </>
+        ) : world ? (
           <>
             <color attach="background" args={[sky.bottom]} />
             <fog attach="fog" args={[sky.bottom, 120, 320]} />
@@ -233,14 +358,15 @@ export default function Game({ me, plots, mode, furniture, held, rotation, onPla
             <Stars night={sun.night} />
             <SunMoon night={sun.night} />
             <WorldLights player={player} level={sun.level} night={sun.night} />
-            <World me={me} nodes={nodes} trees={trees} player={player} anim={anim} hit={hit} onPosition={onPosition} feedTick={feedTick} night={sun.night} />
+            <World me={me} nodes={nodes} trees={trees} player={player} anim={anim} hit={hit} onPosition={onPosition} feedTick={feedTick} night={sun.night} view={view} />
           </>
         ) : (
           <>
             <color attach="background" args={[sun.night > 0.6 ? '#3a3550' : '#ead8cf']} />
             <InteriorLights night={sun.night} />
-            <Interior furniture={furniture} held={held} rotation={rotation} onPlace={onPlace} onPick={onPick} />
-            <InteriorCamera />
+            <Interior me={me} view={view} player={roomPlayer} furniture={furniture} held={held} rotation={rotation} onPlace={onPlace} onPick={onPick}
+              onRotateHeld={onRotateHeld} onRotateItem={onRotateItem} onTarget={onTarget} onBlocked={onBlocked} />
+            <InteriorCamera view={view} roomPlayer={roomPlayer} />
           </>
         )}
       </TimeCtx.Provider>

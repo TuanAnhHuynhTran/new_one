@@ -84,3 +84,27 @@ INSERT IGNORE INTO land_plots(zone_id,plot_code,world_x,world_z,size_x,size_z) V
  (2,'R-001',20,-32,22,22),(2,'R-002',47,-32,22,22),(2,'R-003',20,-4,22,22),(2,'R-004',47,-4,22,22),
  (2,'R-005',20,24,22,22),(2,'R-006',47,24,22,22),(2,'R-007',20,52,22,22),(2,'R-008',47,52,22,22),
  (2,'R-009',20,-60,22,22),(2,'R-010',47,-60,22,22),(2,'R-011',74,-32,22,22),(2,'R-012',74,-4,22,22);
+
+-- Sân vườn sau nhà: kích thước chỉnh được (width chẵn 6–16 m, depth 4–12 m).
+CREATE TABLE IF NOT EXISTS gardens (
+ house_id BIGINT UNSIGNED PRIMARY KEY,
+ width TINYINT UNSIGNED NOT NULL DEFAULT 10,
+ depth TINYINT UNSIGNED NOT NULL DEFAULT 6,
+ harvests INT UNSIGNED NOT NULL DEFAULT 0,
+ FOREIGN KEY(house_id) REFERENCES houses(id) ON DELETE CASCADE
+);
+-- Các khu trong vườn: luống rau (bed) hoặc hồ cá (pond); góc (pos_x, pos_z) và kích thước theo ô 1 m.
+CREATE TABLE IF NOT EXISTS garden_plots (
+ id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+ house_id BIGINT UNSIGNED NOT NULL,
+ kind ENUM('bed','pond') NOT NULL,
+ pos_x TINYINT NOT NULL,
+ pos_z TINYINT NOT NULL,
+ size_w TINYINT UNSIGNED NOT NULL,
+ size_d TINYINT UNSIGNED NOT NULL,
+ crop VARCHAR(20) NULL,
+ planted_at DATETIME(3) NULL,
+ fish VARCHAR(400) NOT NULL DEFAULT '',
+ FOREIGN KEY(house_id) REFERENCES houses(id) ON DELETE CASCADE,
+ INDEX idx_house(house_id)
+);

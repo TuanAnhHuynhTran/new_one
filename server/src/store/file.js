@@ -2,8 +2,8 @@
 // nên không có race condition giữa các request; mỗi lần ghi đều lưu ngay xuống đĩa.
 import fs from 'fs';
 import path from 'path';
-import { buildSeed, furnitureCatalog } from '../seed.js';
-import { MAX_FURNITURE, petNow } from './common.js';
+import { buildSeed, furnitureCatalog, seedGardens } from '../seed.js';
+import { GARDEN, MAX_FURNITURE, fishChange, harvestChange, petNow, plantChange, plotError, publicPlot, resizeError } from './common.js';
 
 export function createFileStore(file) {
   let data;
@@ -16,6 +16,14 @@ export function createFileStore(file) {
     data = JSON.parse(fs.readFileSync(file, 'utf8'));
     // Danh mục nội thất là dữ liệu tĩnh: luôn lấy bản mới nhất từ seed.js.
     data.furniture_catalog = furnitureCatalog;
+    // File dữ liệu tạo từ phiên bản cũ chưa có sân vườn.
+    if (!data.gardens) {
+      data.gardens = [];
+      data.garden_plots = [];
+      data.seq.garden_plots = 0;
+      seedGardens(data);
+      persist();
+    }
   } else {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     data = buildSeed();
@@ -27,6 +35,26 @@ export function createFileStore(file) {
   const findUser = username => data.users.find(u => u.username.toLowerCase() === username.toLowerCase());
   const zoneSlug = zoneId => data.zones.find(z => z.id === zoneId)?.slug;
   const houseOf = userId => data.houses.find(h => h.user_id === userId);
+  // Vườn được tạo mặc định ở lần đầu mở.
+  const gardenOf = userId => {
+    const h = houseOf(userId);
+    if (!h) return null;
+    let g = data.gardens.find(x => x.house_id === h.id);
+    if (!g) { g = { house_id: h.id, width: GARDEN.defaultW, depth: GARDEN.defaultD, harvests: 0 }; data.gardens.push(g); persist(); }
+    return g;
+  };
+  const plotsOf = g => data.garden_plots.filter(p => p.house_id === g.house_id);
+  const gardenView = g => ({ width: g.width, depth: g.depth, harvests: g.harvests, plots: plotsOf(g).sort((a, b) => a.id - b.id).map(publicPlot) });
+  // Áp dụng một thao tác (plantChange / harvestChange / fishChange) lên khu id của người chơi.
+  const updatePlot = (userId, id, make) => {
+    const g = gardenOf(userId);
+    const p = g && data.garden_plots.find(x => x.id === id && x.house_id === g.house_id);
+    if (!p) return { error: 'NOT_FOUND' };
+    const r = make(p);
+    if (r.error) return r;
+    Object.assign(p, r.changes);
+    return { g, plot: p };
+  };
   const petsOf = userId => data.pets.filter(p => p.user_id === userId).map(p => ({ id: p.id, name: p.name, species: p.species, ...petNow(p) }));
 
   return {
@@ -130,6 +158,76 @@ export function createFileStore(file) {
       }
       persist();
       return petsOf(userId);
+    },
+
+    async getGarden(userId) {
+      const g = gardenOf(userId);
+      return g && gardenView(g);
+    },
+
+    async resizeGarden(userId, width, depth) {
+      const g = gardenOf(userId);
+      if (!g) return { error: 'NO_HOUSE' };
+      const error = resizeError(width, depth, plotsOf(g));
+      if (error) return { error };
+      g.width = width; g.depth = depth;
+      persist();
+      return gardenView(g);
+    },
+
+    async addPlot(userId, c) {
+      const g = gardenOf(userId);
+      if (!g) return { error: 'NO_HOUSE' };
+      const plots = plotsOf(g);
+      if (plots.length >= GARDEN.maxPlots) return { error: 'LIMIT' };
+      const error = plotError(g, plots, c);
+      if (error) return { error };
+      const row = { id: ++data.seq.garden_plots, house_id: g.house_id, kind: c.kind, x: c.x, z: c.z, w: c.w, d: c.d, crop: null, planted_at: null, fish: [] };
+      data.garden_plots.push(row);
+      persist();
+      return publicPlot(row);
+    },
+
+    async movePlot(userId, id, { x, z, w, d }) {
+      const g = gardenOf(userId);
+      const p = g && data.garden_plots.find(r => r.id === id && r.house_id === g.house_id);
+      if (!p) return { error: 'NOT_FOUND' };
+      const error = plotError(g, plotsOf(g), { kind: p.kind, x, z, w, d }, p.id);
+      if (error) return { error };
+      Object.assign(p, { x, z, w, d });
+      persist();
+      return publicPlot(p);
+    },
+
+    async deletePlot(userId, id) {
+      const g = gardenOf(userId);
+      const i = g ? data.garden_plots.findIndex(p => p.id === id && p.house_id === g.house_id) : -1;
+      if (i < 0) return false;
+      data.garden_plots.splice(i, 1);
+      persist();
+      return true;
+    },
+
+    async plantPlot(userId, id, crop) {
+      const r = updatePlot(userId, id, p => plantChange(p, crop));
+      if (r.error) return r;
+      persist();
+      return publicPlot(r.plot);
+    },
+
+    async harvestPlot(userId, id) {
+      const r = updatePlot(userId, id, p => harvestChange(p));
+      if (r.error) return r;
+      r.g.harvests += 1;
+      persist();
+      return { plot: publicPlot(r.plot), harvests: r.g.harvests };
+    },
+
+    async addFish(userId, id, species) {
+      const r = updatePlot(userId, id, p => fishChange(p, species));
+      if (r.error) return r;
+      persist();
+      return publicPlot(r.plot);
     },
 
     async savePosition(userId, x, z) {

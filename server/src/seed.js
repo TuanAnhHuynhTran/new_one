@@ -41,6 +41,18 @@ export const demoAccounts = [
       { catalogId: 8, x: 3, z: 2, rotation: -Math.PI / 2 },
       { catalogId: 9, x: -4, z: 1.5, rotation: Math.PI / 2 },
     ],
+    // Sân vườn: age = số phút đã gieo trước lúc tạo dữ liệu (rau cải chín, cà chua đang lớn, cây cam có quả).
+    garden: {
+      width: 10, depth: 7,
+      plots: [
+        { kind: 'bed', x: -5, z: 0, w: 3, d: 2, crop: 'cabbage', age: 10 },
+        { kind: 'bed', x: -5, z: 3, w: 3, d: 2, crop: 'tomato', age: 2 },
+        { kind: 'pond', x: 0, z: 0, w: 3, d: 3, fish: ['goldfish', 'koi', 'koi', 'guppy'] },
+        { kind: 'bed', x: 0, z: 4, w: 2, d: 2, crop: 'orange', age: 30 },
+        { kind: 'bed', x: 4, z: 0, w: 1, d: 3, crop: 'sunflower', age: 6 },
+        { kind: 'bed', x: 3, z: 4, w: 2, d: 2 },
+      ],
+    },
   },
   {
     username: 'thanhpho', password: 'demo1234', zone: 'city', plotCode: 'C-001',
@@ -49,6 +61,7 @@ export const demoAccounts = [
       { catalogId: 1, x: 0, z: 1.5, rotation: 0 },
       { catalogId: 3, x: -4, z: -3, rotation: 0 },
     ],
+    garden: { width: 8, depth: 5, plots: [{ kind: 'bed', x: -3, z: 0, w: 2, d: 2, crop: 'carrot', age: 1 }] },
   },
 ];
 
@@ -60,9 +73,9 @@ export function buildSeed() {
   ];
   const data = {
     meta: { version: 1, created_at: now, jwt_secret: crypto.randomBytes(48).toString('hex') },
-    seq: { users: 0, houses: 0, house_furniture: 0, pets: 0 },
+    seq: { users: 0, houses: 0, house_furniture: 0, pets: 0, garden_plots: 0 },
     zones, land_plots, furniture_catalog: furnitureCatalog,
-    users: [], characters: [], houses: [], house_furniture: [], pets: [],
+    users: [], characters: [], houses: [], house_furniture: [], pets: [], gardens: [], garden_plots: [],
   };
   for (const acc of demoAccounts) {
     const plot = land_plots.find(p => p.plot_code === acc.plotCode);
@@ -77,5 +90,20 @@ export function buildSeed() {
     }
     data.pets.push({ id: ++data.seq.pets, user_id: userId, ...acc.pet, last_fed_at: now });
   }
+  seedGardens(data);
   return data;
+}
+
+// Thêm vườn mẫu cho các tài khoản demo chưa có vườn (dùng cả khi nâng cấp file dữ liệu cũ).
+export function seedGardens(data) {
+  for (const acc of demoAccounts) {
+    const user = data.users.find(u => u.username === acc.username);
+    const house = user && data.houses.find(h => h.user_id === user.id);
+    if (!house || !acc.garden || data.gardens.some(g => g.house_id === house.id)) continue;
+    data.gardens.push({ house_id: house.id, width: acc.garden.width, depth: acc.garden.depth, harvests: 0 });
+    for (const p of acc.garden.plots) {
+      const planted = p.crop ? new Date(Date.now() - (p.age || 0) * 60000).toISOString() : null;
+      data.garden_plots.push({ id: ++data.seq.garden_plots, house_id: house.id, kind: p.kind, x: p.x, z: p.z, w: p.w, d: p.d, crop: p.crop || null, planted_at: planted, fish: p.fish || [] });
+    }
+  }
 }

@@ -234,3 +234,47 @@ export function useOccluder() {
   }, []);
   return ref;
 }
+
+// Bật/tắt chế độ mờ cho toàn bộ vật liệu trong một khối (lưu lại giá trị gốc để khôi phục).
+function setFade(root, on) {
+  root.traverse(m => {
+    if (!m.isMesh) return;
+    (Array.isArray(m.material) ? m.material : [m.material]).forEach(mt => {
+      if (on && !mt.userData.fade) {
+        mt.userData.fade = { t: mt.transparent, o: mt.opacity, d: mt.depthWrite };
+        mt.transparent = true; mt.opacity = 0.18 * mt.opacity; mt.depthWrite = false; mt.needsUpdate = true;
+      } else if (!on && mt.userData.fade) {
+        const f = mt.userData.fade;
+        mt.transparent = f.t; mt.opacity = f.o; mt.depthWrite = f.d; mt.needsUpdate = true;
+        delete mt.userData.fade;
+      }
+    });
+  });
+}
+// Làm mờ mọi vật che (occluders) nằm giữa camera và một điểm (đầu nhân vật).
+export function makeFader() {
+  const faded = new Set(), ray = new THREE.Raycaster(), dir = new THREE.Vector3();
+  return {
+    update(camera, head) {
+      dir.subVectors(camera.position, head);
+      const far = dir.length();
+      ray.set(head, dir.normalize());
+      ray.far = far;
+      const now = new Set();
+      for (const h of ray.intersectObjects([...occluders], true)) {
+        let o = h.object;
+        while (o && !occluders.has(o)) o = o.parent;
+        if (o) now.add(o);
+      }
+      faded.forEach(o => { if (!now.has(o)) { setFade(o, false); faded.delete(o); } });
+      now.forEach(o => { if (!faded.has(o)) { setFade(o, true); faded.add(o); } });
+    },
+    clear() { faded.forEach(o => setFade(o, false)); faded.clear(); },
+  };
+}
+// Chuyển FOV camera mượt (góc nhìn thứ 3 dùng FOV rộng hơn).
+export function lerpFov(camera, fov, dt) {
+  if (Math.abs(camera.fov - fov) < 0.05) return;
+  camera.fov += (fov - camera.fov) * Math.min(1, dt * 5);
+  camera.updateProjectionMatrix();
+}

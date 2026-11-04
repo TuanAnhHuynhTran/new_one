@@ -1,14 +1,41 @@
 // Lưu trữ MySQL (DB_DRIVER=mysql). Cần chạy database/schema.sql trước.
 import mysql from 'mysql2/promise';
-import { MAX_FURNITURE, HUNGER_MINUTES, HAPPY_MINUTES } from './common.js';
+import { GARDEN, MAX_FURNITURE, HUNGER_MINUTES, HAPPY_MINUTES, fishChange, harvestChange, plantChange, plotError, publicPlot, resizeError } from './common.js';
 
 const ELAPSED = 'TIMESTAMPDIFF(MINUTE,COALESCE(last_fed_at,NOW()),NOW())';
 const HUNGER_NOW = `LEAST(100,CAST(hunger AS SIGNED)+FLOOR(${ELAPSED}/${HUNGER_MINUTES}))`;
 const HAPPY_NOW = `GREATEST(0,CAST(happiness AS SIGNED)-FLOOR(${ELAPSED}/${HAPPY_MINUTES}))`;
+const PLOT_SELECT = 'SELECT id,kind,pos_x x,pos_z z,size_w w,size_d d,crop,planted_at,fish FROM garden_plots';
+// planted_at lưu dạng DATETIME theo giờ UTC (pool đặt timezone Z) → trả về chuỗi ISO giống chế độ file.
+const rowToPlot = r => publicPlot({ ...r, planted_at: r.planted_at ? new Date(r.planted_at).toISOString() : null, fish: r.fish ? r.fish.split(',') : [] });
+const toDate = iso => (iso ? new Date(iso) : null);
 const PET_SELECT = `SELECT id,name,species,${HUNGER_NOW} hunger,${HAPPY_NOW} happiness FROM pets WHERE user_id=?`;
 
 export function createMysqlStore({ host, port, user, password, database }) {
-  const db = mysql.createPool({ host, port, user, password, database, waitForConnections: true, connectionLimit: 10, decimalNumbers: true });
+  const db = mysql.createPool({ host, port, user, password, database, waitForConnections: true, connectionLimit: 10, decimalNumbers: true, timezone: 'Z' });
+  // Vườn của người chơi (tạo mặc định ở lần đầu).
+  const gardenOf = async userId => {
+    const [h] = await db.query('SELECT id FROM houses WHERE user_id=?', [userId]);
+    if (!h.length) return null;
+    await db.query('INSERT IGNORE INTO gardens(house_id,width,depth) VALUES (?,?,?)', [h[0].id, GARDEN.defaultW, GARDEN.defaultD]);
+    const [g] = await db.query('SELECT house_id,width,depth,harvests FROM gardens WHERE house_id=?', [h[0].id]);
+    const [rows] = await db.query(PLOT_SELECT + ' WHERE house_id=? ORDER BY id', [h[0].id]);
+    return { ...g[0], plots: rows.map(rowToPlot) };
+  };
+  const view = g => ({ width: g.width, depth: g.depth, harvests: g.harvests, plots: g.plots });
+  const updatePlot = async (userId, id, make) => {
+    const g = await gardenOf(userId);
+    const p = g && g.plots.find(x => x.id === id);
+    if (!p) return { error: 'NOT_FOUND' };
+    const r = make(p);
+    if (r.error) return r;
+    const c = r.changes, sets = [], vals = [];
+    if ('crop' in c) { sets.push('crop=?'); vals.push(c.crop); }
+    if ('planted_at' in c) { sets.push('planted_at=?'); vals.push(toDate(c.planted_at)); }
+    if ('fish' in c) { sets.push('fish=?'); vals.push(c.fish.join(',')); }
+    await db.query(`UPDATE garden_plots SET ${sets.join(',')} WHERE id=? AND house_id=?`, [...vals, id, g.house_id]);
+    return { g, plot: { ...p, ...c } };
+  };
   return {
     driver: 'mysql',
     fallbackSecret: null,
@@ -94,6 +121,62 @@ export function createMysqlStore({ host, port, user, password, database }) {
       if (!r.affectedRows) return null;
       const [pets] = await db.query(PET_SELECT, [userId]);
       return pets;
+    },
+
+    async getGarden(userId) {
+      const g = await gardenOf(userId);
+      return g && view(g);
+    },
+
+    async resizeGarden(userId, width, depth) {
+      const g = await gardenOf(userId);
+      if (!g) return { error: 'NO_HOUSE' };
+      const error = resizeError(width, depth, g.plots);
+      if (error) return { error };
+      await db.query('UPDATE gardens SET width=?,depth=? WHERE house_id=?', [width, depth, g.house_id]);
+      return view({ ...g, width, depth });
+    },
+
+    async addPlot(userId, c) {
+      const g = await gardenOf(userId);
+      if (!g) return { error: 'NO_HOUSE' };
+      if (g.plots.length >= GARDEN.maxPlots) return { error: 'LIMIT' };
+      const error = plotError(g, g.plots, c);
+      if (error) return { error };
+      const [r] = await db.query('INSERT INTO garden_plots(house_id,kind,pos_x,pos_z,size_w,size_d) VALUES (?,?,?,?,?,?)', [g.house_id, c.kind, c.x, c.z, c.w, c.d]);
+      return publicPlot({ id: r.insertId, ...c });
+    },
+
+    async movePlot(userId, id, { x, z, w, d }) {
+      const g = await gardenOf(userId);
+      const p = g && g.plots.find(r => r.id === id);
+      if (!p) return { error: 'NOT_FOUND' };
+      const error = plotError(g, g.plots, { kind: p.kind, x, z, w, d }, id);
+      if (error) return { error };
+      await db.query('UPDATE garden_plots SET pos_x=?,pos_z=?,size_w=?,size_d=? WHERE id=? AND house_id=?', [x, z, w, d, id, g.house_id]);
+      return publicPlot({ ...p, x, z, w, d });
+    },
+
+    async deletePlot(userId, id) {
+      const [r] = await db.query('DELETE p FROM garden_plots p JOIN houses h ON p.house_id=h.id WHERE p.id=? AND h.user_id=?', [id, userId]);
+      return r.affectedRows > 0;
+    },
+
+    async plantPlot(userId, id, crop) {
+      const r = await updatePlot(userId, id, p => plantChange(p, crop));
+      return r.error ? r : publicPlot(r.plot);
+    },
+
+    async harvestPlot(userId, id) {
+      const r = await updatePlot(userId, id, p => harvestChange(p));
+      if (r.error) return r;
+      await db.query('UPDATE gardens SET harvests=harvests+1 WHERE house_id=?', [r.g.house_id]);
+      return { plot: publicPlot(r.plot), harvests: r.g.harvests + 1 };
+    },
+
+    async addFish(userId, id, species) {
+      const r = await updatePlot(userId, id, p => fishChange(p, species));
+      return r.error ? r : publicPlot(r.plot);
     },
 
     async savePosition(userId, x, z) {

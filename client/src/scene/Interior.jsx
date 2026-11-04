@@ -1,11 +1,31 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useFrame, useThree } from '@react-three/fiber';
 import { RoundedBox } from '@react-three/drei';
 import * as THREE from 'three';
-import { GhostCtx, Mat, planks, radialGlow, verticalFade, mix, useNight } from './kit.jsx';
+import { GhostCtx, Mat, planks, radialGlow, verticalFade, mix, useNight, useOccluder } from './kit.jsx';
+import { Avatar, Puppy, hairColor, shirtColor } from './Characters.jsx';
+import { clamp, stepWalker, useWalkControls } from './walk.js';
 
-// Giới hạn đặt đồ khớp với validation của server (|x| ≤ 4.4, |z| ≤ 3.6), làm tròn lưới 0.5.
-export const PLACE_LIMIT = { x: 4, z: 3.5 };
-const snap = (v, lim) => Math.max(-lim, Math.min(lim, Math.round(v * 2) / 2));
+// Giới hạn tâm món đồ khớp với validation của server (|x| ≤ 4.4, |z| ≤ 3.6).
+const LIMIT = { x: 4.4, z: 3.6 };
+// Mép trong của phòng: tường trái x=-4.9, tường sau z=-3.9; mép sàn phải x=5.2, trước z=4.2.
+const WALL = { x0: -4.9, x1: 5.1, z0: -3.9, z1: 4.1 };
+// Vùng nhân vật đi được trong phòng.
+const WALK = { x0: -4.55, x1: 4.75, z0: -3.55, z1: 3.85 };
+const PLAYER_R = 0.3;
+
+// Kích thước chân đế từng loại đồ (rộng theo X, sâu theo Z khi chưa xoay).
+const FOOT = { sofa: [2.4, 1.0], table: [1.7, 1.05], plant: [0.7, 0.7], bed: [2.1, 2.65], lamp: [0.55, 0.55], bookshelf: [1.5, 0.5], rug: [2.8, 1.8], chair: [0.6, 0.6], fridge: [1.0, 0.9] };
+export function footprint(kind, rot) {
+  const [w, d] = FOOT[kind] || [0.8, 0.8];
+  const c = Math.abs(Math.cos(rot)), s = Math.abs(Math.sin(rot));
+  return { hw: (c * w) / 2 + (s * d) / 2, hd: (s * w) / 2 + (c * d) / 2 };
+}
+const boxOf = f => ({ x: Number(f.pos_x), z: Number(f.pos_z), ...footprint(f.kind, Number(f.rotation_y || 0)), rug: f.kind === 'rug' });
+const rectDist = (px, pz, b) => Math.hypot(Math.max(Math.abs(px - b.x) - b.hw, 0), Math.max(Math.abs(pz - b.z) - b.hd, 0));
+const overlap = (a, b) => Math.abs(a.x - b.x) < a.hw + b.hw - 0.02 && Math.abs(a.z - b.z) < a.hd + b.hd - 0.02;
+// Khung vuông (nửa cạnh = 1) dùng để đánh dấu món đồ đang nhắm tới.
+const squareRing = new THREE.RingGeometry(1.32, 1.414, 4, 1).rotateZ(Math.PI / 4);
 
 // ---------- Căn phòng kiểu diorama: hai bức tường cắt lớp, sàn gỗ, cửa sổ nắng chiều ----------
 function Room() {
@@ -17,14 +37,20 @@ function Room() {
   }, []);
   const wall = '#f8efe6', trim = '#b67a4b';
   const sun = 1 - night * 0.85;
+  // Hai bức tường là vật che: ở góc nhìn thứ 3 sẽ mờ đi khi chắn camera.
+  const backWall = useOccluder(), leftWall = useOccluder();
   return (
     <group>
       <mesh position={[0, -0.2, 0]} material={floorMats} receiveShadow><boxGeometry args={[10.4, 0.4, 8.4]} /></mesh>
       {/* Tường sau (z-) và tường trái (x-) */}
-      <mesh position={[0, 2, -4.05]} receiveShadow castShadow><boxGeometry args={[10.4, 4.8, 0.3]} /><Mat color={wall} rough={0.95} /></mesh>
-      <mesh position={[-5.05, 2, 0]} receiveShadow castShadow><boxGeometry args={[0.3, 4.8, 8.4]} /><Mat color={mix(wall, '#d9c2ae', 0.25)} rough={0.95} /></mesh>
-      <mesh position={[0, 4.48, -4.05]} castShadow><boxGeometry args={[10.7, 0.25, 0.5]} /><Mat color={trim} /></mesh>
-      <mesh position={[-5.05, 4.48, 0.1]} castShadow><boxGeometry args={[0.5, 0.25, 8.6]} /><Mat color={trim} /></mesh>
+      <group ref={backWall}>
+        <mesh position={[0, 2, -4.05]} receiveShadow castShadow><boxGeometry args={[10.4, 4.8, 0.3]} /><Mat color={wall} rough={0.95} /></mesh>
+        <mesh position={[0, 4.48, -4.05]} castShadow><boxGeometry args={[10.7, 0.25, 0.5]} /><Mat color={trim} /></mesh>
+      </group>
+      <group ref={leftWall}>
+        <mesh position={[-5.05, 2, 0]} receiveShadow castShadow><boxGeometry args={[0.3, 4.8, 8.4]} /><Mat color={mix(wall, '#d9c2ae', 0.25)} rough={0.95} /></mesh>
+        <mesh position={[-5.05, 4.48, 0.1]} castShadow><boxGeometry args={[0.5, 0.25, 8.6]} /><Mat color={trim} /></mesh>
+      </group>
       <mesh position={[0, 0.1, -3.88]}><boxGeometry args={[10, 0.2, 0.06]} /><Mat color="#efe2d2" /></mesh>
       <mesh position={[-4.88, 0.1, 0]}><boxGeometry args={[0.06, 0.2, 8]} /><Mat color="#efe2d2" /></mesh>
 
@@ -211,54 +237,100 @@ export function FurnitureModel({ kind, ghost = false }) {
   return <M ghost={ghost} />;
 }
 
-// held: món đang cầm trên tay — { kind } (món mới từ thanh nội thất) hoặc { kind, id, x, z } (món đã đặt được nhấc lên).
-function PlacedItem({ item, held, onPick }) {
-  const [hover, setHover] = useState(false);
-  return (
-    <group
-      position={[Number(item.pos_x), 0, Number(item.pos_z)]}
-      rotation={[0, Number(item.rotation_y || 0), 0]}
-      scale={hover && !held ? 1.04 : 1}
-      onPointerOver={e => { if (held) return; e.stopPropagation(); setHover(true); document.body.style.cursor = 'grab'; }}
-      onPointerOut={() => { setHover(false); document.body.style.cursor = ''; }}
-      onPointerDown={e => {
-        // Đang cầm đồ thì để sự kiện rơi xuống sàn (đặt đồ, kể cả lên thảm). Chỉ chuột trái mới nhấc đồ.
-        if (held || e.button !== 0) return;
-        e.stopPropagation();
-        setHover(false); document.body.style.cursor = '';
-        onPick?.(item);
-      }}
-    >
-      <FurnitureModel kind={item.kind} />
-      {hover && !held && <mesh position={[0, 0.03, 0]} rotation={[-Math.PI / 2, 0, 0]}><ringGeometry args={[0.9, 1.05, 32]} /><meshBasicMaterial color="#5fbfae" transparent opacity={0.8} depthWrite={false} /></mesh>}
-    </group>
-  );
-}
+// ---------- Điều khiển trong nhà: nhân vật đi tới đồ vật và thao tác ----------
+// held: món đang cầm — { kind } (món mới từ thanh nội thất) hoặc { kind, id } (món đã đặt được nhấc lên).
+export function Interior({ me, view, player, furniture, held, rotation, onPlace, onPick, onRotateHeld, onRotateItem, onTarget, onBlocked }) {
+  useEffect(() => { Object.assign(player.current, { x: 0, z: 3, angle: Math.PI, speed: 0 }); view.current.rYaw = null; }, [player, view]);
+  const anim = useRef({ moving: false, run: false });
+  const vel = useRef({ x: 0, z: 0 });
+  const avatar = useRef(), ghost = useRef(), ghostRing = useRef(), targetRing = useRef();
+  const spot = useRef({ x: 0, z: 0, valid: false });
+  const [target, setTarget] = useState(null);
+  const { gl } = useThree();
+  const latest = useRef();
+  latest.current = { furniture, held, rotation, target, onPlace, onPick, onRotateHeld, onRotateItem, onBlocked };
 
-export function Interior({ furniture, held, rotation, onPlace, onPick }) {
-  const [hover, setHover] = useState(null);
-  // Nhấc một món lên: bản xem trước bắt đầu ngay tại chỗ cũ của nó.
-  useEffect(() => { setHover(held?.id ? { x: held.x, z: held.z } : null); }, [held]);
-  const at = e => ({ x: snap(e.point.x, PLACE_LIMIT.x), z: snap(e.point.z, PLACE_LIMIT.z) });
+  useEffect(() => { onTarget?.(target); }, [target, onTarget]);
+  useEffect(() => { if (held) setTarget(null); }, [held]);
+
+  // Chuột trái: nhấc / đặt. Chuột phải: xoay.
+  const keys = useWalkControls(gl, view, button => {
+    const L = latest.current;
+    if (button === 0) {
+      if (L.held) { if (spot.current.valid) L.onPlace({ x: spot.current.x, z: spot.current.z }); else L.onBlocked?.(); }
+      else if (L.target) L.onPick(L.target);
+    } else if (button === 2) {
+      if (L.held) L.onRotateHeld(); else if (L.target) L.onRotateItem(L.target);
+    }
+  });
+
+  useFrame((_, rawDt) => {
+    const dt = Math.min(rawDt, 0.06), p = player.current, v = vel.current, k = keys.current;
+    const L = latest.current;
+    const boxes = L.furniture.filter(f => f.id !== L.held?.id).map(f => ({ f, ...boxOf(f) }));
+    // ---- Di chuyển có quán tính, bị chặn bởi tường và đồ đạc (trừ thảm) ----
+    stepWalker({ p, v, k, view, dt, anim, walk: WALK, hit: (x, z) => boxes.some(b => !b.rug && rectDist(x, z, b) < PLAYER_R) });
+    avatar.current?.position.set(p.x, 0, p.z);
+    if (avatar.current) avatar.current.rotation.y = p.angle;
+    const dx = Math.sin(p.angle), dz = Math.cos(p.angle);
+
+    if (L.held) {
+      // ---- Đang cầm đồ: vị trí đặt là ô lưới ngay trước mặt ----
+      const fp = footprint(L.held.kind, L.rotation);
+      const reach = 0.45 + Math.abs(dx) * fp.hw + Math.abs(dz) * fp.hd;
+      const sx = clamp(Math.round((p.x + dx * reach) * 2) / 2, Math.max(-LIMIT.x, WALL.x0 + fp.hw), Math.min(LIMIT.x, WALL.x1 - fp.hw));
+      const sz = clamp(Math.round((p.z + dz * reach) * 2) / 2, Math.max(-LIMIT.z, WALL.z0 + fp.hd), Math.min(LIMIT.z, WALL.z1 - fp.hd));
+      const box = { x: sx, z: sz, ...fp, rug: L.held.kind === 'rug' };
+      const valid = !boxes.some(b => b.rug === box.rug && overlap(box, b)) && (box.rug || rectDist(p.x, p.z, box) > PLAYER_R - 0.05);
+      spot.current = { x: sx, z: sz, valid };
+      if (ghost.current) { ghost.current.position.set(sx, 0, sz); ghost.current.rotation.y = L.rotation; }
+      ghostRing.current?.material.color.set(valid ? '#5fbfae' : '#f2727a');
+      if (targetRing.current) targetRing.current.visible = false;
+      return;
+    }
+    // ---- Tay không: tìm món đồ gần nhất ở trước mặt ----
+    let best = null, bestScore = 1.1;
+    for (const b of boxes) {
+      const d = rectDist(p.x, p.z, b);
+      if (d > 0.9) continue;
+      const tx = b.x - p.x, tz = b.z - p.z, tl = Math.hypot(tx, tz) || 1;
+      const facing = (tx * dx + tz * dz) / tl;
+      if (facing < -0.25 && d > 0.05) continue;
+      const score = d - facing * 0.35 + (b.rug ? 0.7 : 0);
+      if (score < bestScore) { bestScore = score; best = b; }
+    }
+    if ((best?.f.id ?? null) !== (L.target?.id ?? null)) setTarget(best ? best.f : null);
+    if (targetRing.current) {
+      targetRing.current.visible = !!best;
+      if (best) {
+        targetRing.current.position.set(best.x, 0.04, best.z);
+        targetRing.current.scale.set(best.hw + 0.2, best.hd + 0.2, 1);
+      }
+    }
+  });
+
   return (
     <group>
       <Room />
-      <mesh
-        position={[0, 0.012, 0]} rotation={[-Math.PI / 2, 0, 0]}
-        onPointerMove={e => held && setHover(at(e))}
-        onPointerDown={e => { if (!held || e.button !== 0) return; e.stopPropagation(); onPlace(at(e)); }}
-      >
-        <planeGeometry args={[9.8, 7.8]} />
-        <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+      {furniture.filter(item => item.id !== held?.id).map(item => (
+        <group key={item.id} position={[Number(item.pos_x), 0, Number(item.pos_z)]} rotation={[0, Number(item.rotation_y || 0), 0]} scale={target?.id === item.id ? 1.05 : 1}>
+          <FurnitureModel kind={item.kind} />
+        </group>
+      ))}
+      {/* Khung vuông đánh dấu món đồ có thể thao tác */}
+      <mesh ref={targetRing} geometry={squareRing} rotation={[-Math.PI / 2, 0, 0]} visible={false}>
+        <meshBasicMaterial color="#5fbfae" transparent opacity={0.9} depthWrite={false} />
       </mesh>
-      {held && <gridHelper args={[9, 18, '#ffffff', '#ffffff']} position={[0, 0.02, 0]} material-transparent material-opacity={0.25} />}
-      {furniture.filter(item => item.id !== held?.id).map(item => <PlacedItem key={item.id} item={item} held={!!held} onPick={onPick} />)}
-      {held && hover && (
-        <group position={[hover.x, 0, hover.z]} rotation={[0, rotation, 0]}>
+      {held && (
+        <group ref={ghost}>
           <GhostCtx.Provider value={true}><FurnitureModel kind={held.kind} ghost /></GhostCtx.Provider>
-          <mesh position={[0, 0.03, 0]} rotation={[-Math.PI / 2, 0, 0]}><ringGeometry args={[0.85, 1, 32]} /><meshBasicMaterial color="#5fbfae" transparent opacity={0.8} depthWrite={false} /></mesh>
+          <mesh ref={ghostRing} position={[0, 0.03, 0]} rotation={[-Math.PI / 2, 0, 0]}><ringGeometry args={[0.85, 1, 32]} /><meshBasicMaterial color="#5fbfae" transparent opacity={0.8} depthWrite={false} /></mesh>
         </group>
       )}
+      <group ref={avatar} position={[0, 0, 3]} rotation={[0, Math.PI, 0]}>
+        <Avatar anim={anim} shirt={shirtColor(me?.id)} hair={hairColor(me?.id)} name={me?.display_name} />
+      </group>
+      <Puppy player={player} bounds={WALK} />
     </group>
   );
 }
