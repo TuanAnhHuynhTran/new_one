@@ -1,0 +1,6 @@
+{
+ "name":"life-world-client","version":"0.1.0","private":true,"type":"module",
+ "scripts":{"dev":"vite --host 0.0.0.0","build":"vite build","preview":"vite preview --host 0.0.0.0"},
+ "dependencies":{"react":"^19.0.0","react-dom":"^19.0.0","three":"^0.181.0","@react-three/fiber":"^9.0.0","@react-three/drei":"^10.0.0","lucide-react":"^0.460.0"},
+ "devDependencies":{"vite":"^7.0.0","@types/react":"^19.0.0","@types/react-dom":"^19.0.0","@types/three":"^0.181.0"}
+}
