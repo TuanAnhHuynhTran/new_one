@@ -1,4 +1,9 @@
 export const MAX_FURNITURE = 80;
+// Ngôi nhà 2 lầu + sân thượng (16 × 11 m, ban công nhô ra phía trước): giới hạn tâm món đồ và số tầng.
+export const HOUSE = { x: 7.9, z0: -5.4, z1: 7.4, floors: 3 };
+export const furnitureSpotOk = ({ x, z, floor, rotation }) =>
+  [x, z, rotation].every(n => typeof n === 'number' && Number.isFinite(n)) && Number.isInteger(floor) && floor >= 0 && floor < HOUSE.floors
+  && Math.abs(x) <= HOUSE.x && z >= HOUSE.z0 && z <= HOUSE.z1 && Math.abs(rotation) <= 6.284;
 
 // Nhu cầu pet suy giảm theo thời gian kể từ lần cho ăn gần nhất: đói +5/giờ (1 điểm/12 phút), vui -3/giờ (1 điểm/20 phút).
 export const HUNGER_MINUTES = 12;

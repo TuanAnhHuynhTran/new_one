@@ -1,10 +1,10 @@
 // Sân vườn sau nhà: bãi cỏ có hàng rào cây, mảnh vườn chỉnh được kích thước,
 // bên trong là các luống rau / cây ăn quả và hồ cá do người chơi tự xây.
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
 import { RoundedBox } from '@react-three/drei';
 import * as THREE from 'three';
-import { GhostCtx, Inst, Mat, checker, hash, mix, rng, useNight, useOccluder } from './kit.jsx';
+import { GhostCtx, Inst, Mat, ScreenLabel, checker, hash, mix, rng, useNight, useOccluder } from './kit.jsx';
 import { Trees } from './Nature.jsx';
 import { Avatar, Puppy, hairColor, shirtColor } from './Characters.jsx';
 import { clamp, stepWalker, useWalkControls } from './walk.js';
@@ -323,9 +323,14 @@ export function PlotModel({ plot, crops, now }) {
 
 // ---------- Cảnh sân vườn ----------
 // held: khu đang cầm để đặt { kind, w, d, id? } (id có nghĩa là đang di chuyển khu đã có).
-export function Garden({ me, view, player, garden, crops, now, held, onPlace, onRotateHeld, onAction, onPickPlot, onTarget, onBlocked }) {
+export function Garden({ me, view, player, garden, crops, now, held, onPlace, onRotateHeld, onAction, onPickPlot, onTarget, onBlocked, entry = 'yard', onEnterHouse }) {
   // Xuất hiện ở đầu vườn, quay mặt về phía nhà để thấy cả mảnh vườn.
-  useEffect(() => { Object.assign(player.current, { x: 0, z: GZ + garden.depth + 1.2, angle: Math.PI, speed: 0 }); view.current.rYaw = null; }, [player, view]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Đi ra từ cửa sau của nhà → đứng ngay trước cửa, quay mặt ra vườn; còn lại xuất hiện ở đầu vườn, quay về phía nhà.
+  useLayoutEffect(() => {
+    Object.assign(player.current, entry === 'house' ? { x: 0, z: 0.4, angle: 0, speed: 0, y: 0, level: 0 } : { x: 0, z: GZ + garden.depth + 1.2, angle: Math.PI, speed: 0, y: 0, level: 0 });
+    view.current.roomLook.yaw = null; view.current.roomLook.cy = null;
+  }, [player, view]); // eslint-disable-line react-hooks/exhaustive-deps
+  const entered = useRef(false);
   const anim = useRef({ moving: false, run: false });
   const vel = useRef({ x: 0, z: 0 });
   const avatar = useRef(), ghost = useRef(), ghostPad = useRef(), targetRing = useRef();
@@ -356,7 +361,9 @@ export function Garden({ me, view, player, garden, crops, now, held, onPlace, on
     const { width: W, depth: D } = L.garden;
     const others = L.garden.plots.filter(q => q.id !== L.held?.id);
     const boxes = others.map(q => ({ q, ...boxOf(q) }));
-    stepWalker({ p, v: vel.current, k: keys.current, view, dt, anim, walk: WALK, hit: (x, z) => boxes.some(b => rectDist(x, z, b) < PLAYER_R) });
+    stepWalker({ p, v: vel.current, k: keys.current, yaw: view.current.tp ? view.current.roomLook.yaw : null, dt, anim, walk: WALK, hit: (x, z) => boxes.some(b => rectDist(x, z, b) < PLAYER_R) });
+    // Đi vào cửa sau của nhà (giữa tường nhà) → vào trong nhà.
+    if (!entered.current && p.z < WALK.z0 + 0.12 && Math.abs(p.x) < 0.75 && vel.current.z < 0) { entered.current = true; onEnterHouse?.(); }
     avatar.current?.position.set(p.x, 0, p.z);
     if (avatar.current) avatar.current.rotation.y = p.angle;
     const dx = Math.sin(p.angle), dz = Math.cos(p.angle);
@@ -397,6 +404,7 @@ export function Garden({ me, view, player, garden, crops, now, held, onPlace, on
   return (
     <group>
       <Yard zone={me?.zone} />
+      <ScreenLabel position={[0, 2.85, -1.2]} className="door-tag" text="🏠 Vào nhà" />
       <GardenBed width={garden.width} depth={garden.depth} grid={!!held} />
       {garden.plots.filter(q => q.id !== held?.id).map(q => (
         <group key={q.id} position={[q.x + q.w / 2, 0, GZ + q.z + q.d / 2]}>

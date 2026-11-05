@@ -1,18 +1,15 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
 import { RoundedBox } from '@react-three/drei';
 import * as THREE from 'three';
-import { GhostCtx, Mat, planks, radialGlow, verticalFade, mix, useNight, useOccluder } from './kit.jsx';
+import { GhostCtx, Mat } from './kit.jsx';
 import { Avatar, Puppy, hairColor, shirtColor } from './Characters.jsx';
-import { clamp, stepWalker, useWalkControls } from './walk.js';
+import { stepWalker, useKeys } from './walk.js';
+import { DOORS, FIXTURES, House, LEVEL_NAME, SPAWN, levelY, placementOk, roomOf, structureHit, surfaceAt } from './House.jsx';
 
-// Giới hạn tâm món đồ khớp với validation của server (|x| ≤ 4.4, |z| ≤ 3.6).
-const LIMIT = { x: 4.4, z: 3.6 };
-// Mép trong của phòng: tường trái x=-4.9, tường sau z=-3.9; mép sàn phải x=5.2, trước z=4.2.
-const WALL = { x0: -4.9, x1: 5.1, z0: -3.9, z1: 4.1 };
-// Vùng nhân vật đi được trong phòng.
-const WALK = { x0: -4.55, x1: 4.75, z0: -3.55, z1: 3.85 };
-const PLAYER_R = 0.3;
+const PLAYER_R = 0.28;
+// Vùng nhân vật có thể tới (để stepWalker kẹp); va chạm thật do mặt bằng ngôi nhà quyết định.
+const WALK = { x0: -7.9, x1: 7.9, z0: -6.2, z1: 7.4 };
 
 // Kích thước chân đế từng loại đồ (rộng theo X, sâu theo Z khi chưa xoay).
 const FOOT = { sofa: [2.4, 1.0], table: [1.7, 1.05], plant: [0.7, 0.7], bed: [2.1, 2.65], lamp: [0.55, 0.55], bookshelf: [1.5, 0.5], rug: [2.8, 1.8], chair: [0.6, 0.6], fridge: [1.0, 0.9] };
@@ -21,100 +18,14 @@ export function footprint(kind, rot) {
   const c = Math.abs(Math.cos(rot)), s = Math.abs(Math.sin(rot));
   return { hw: (c * w) / 2 + (s * d) / 2, hd: (s * w) / 2 + (c * d) / 2 };
 }
+const floorOf = f => Number(f.floor || 0);
 const boxOf = f => ({ x: Number(f.pos_x), z: Number(f.pos_z), ...footprint(f.kind, Number(f.rotation_y || 0)), rug: f.kind === 'rug' });
 const rectDist = (px, pz, b) => Math.hypot(Math.max(Math.abs(px - b.x) - b.hw, 0), Math.max(Math.abs(pz - b.z) - b.hd, 0));
 const overlap = (a, b) => Math.abs(a.x - b.x) < a.hw + b.hw - 0.02 && Math.abs(a.z - b.z) < a.hd + b.hd - 0.02;
 // Khung vuông (nửa cạnh = 1) dùng để đánh dấu món đồ đang nhắm tới.
 const squareRing = new THREE.RingGeometry(1.32, 1.414, 4, 1).rotateZ(Math.PI / 4);
-
-// ---------- Căn phòng kiểu diorama: hai bức tường cắt lớp, sàn gỗ, cửa sổ nắng chiều ----------
-function Room() {
-  const night = useNight();
-  const floorMats = useMemo(() => {
-    const top = new THREE.MeshStandardMaterial({ map: planks([2, 1.6]), roughness: 0.7 });
-    const side = new THREE.MeshStandardMaterial({ color: '#f1e4d6', roughness: 0.9 });
-    return [side, side, top, side, side, side];
-  }, []);
-  const wall = '#f8efe6', trim = '#b67a4b';
-  const sun = 1 - night * 0.85;
-  // Hai bức tường là vật che: ở góc nhìn thứ 3 sẽ mờ đi khi chắn camera.
-  const backWall = useOccluder(), leftWall = useOccluder();
-  return (
-    <group>
-      <mesh position={[0, -0.2, 0]} material={floorMats} receiveShadow><boxGeometry args={[10.4, 0.4, 8.4]} /></mesh>
-      {/* Tường sau (z-) và tường trái (x-) */}
-      <group ref={backWall}>
-        <mesh position={[0, 2, -4.05]} receiveShadow castShadow><boxGeometry args={[10.4, 4.8, 0.3]} /><Mat color={wall} rough={0.95} /></mesh>
-        <mesh position={[0, 4.48, -4.05]} castShadow><boxGeometry args={[10.7, 0.25, 0.5]} /><Mat color={trim} /></mesh>
-      </group>
-      <group ref={leftWall}>
-        <mesh position={[-5.05, 2, 0]} receiveShadow castShadow><boxGeometry args={[0.3, 4.8, 8.4]} /><Mat color={mix(wall, '#d9c2ae', 0.25)} rough={0.95} /></mesh>
-        <mesh position={[-5.05, 4.48, 0.1]} castShadow><boxGeometry args={[0.5, 0.25, 8.6]} /><Mat color={trim} /></mesh>
-      </group>
-      <mesh position={[0, 0.1, -3.88]}><boxGeometry args={[10, 0.2, 0.06]} /><Mat color="#efe2d2" /></mesh>
-      <mesh position={[-4.88, 0.1, 0]}><boxGeometry args={[0.06, 0.2, 8]} /><Mat color="#efe2d2" /></mesh>
-
-      {/* Cửa sổ + rèm hồng + vệt nắng */}
-      <group position={[2.4, 2.35, -3.88]}>
-        <mesh><boxGeometry args={[2.1, 2.3, 0.1]} /><Mat color="#c89466" /></mesh>
-        <mesh position={[0, 0, 0.03]}><boxGeometry args={[1.8, 2, 0.06]} /><Mat color={night > 0.6 ? '#3d4a7d' : '#ffe2a8'} emissive={night > 0.6 ? '#6f7fc0' : '#ffd27a'} ei={night > 0.6 ? 0.4 : 1.1} toneMapped={false} /></mesh>
-        <mesh position={[0, 0, 0.08]}><boxGeometry args={[0.08, 2, 0.04]} /><Mat color="#c89466" /></mesh>
-        <mesh position={[0, 0.1, 0.08]}><boxGeometry args={[1.8, 0.08, 0.04]} /><Mat color="#c89466" /></mesh>
-        <mesh position={[0, -1.15, 0.18]}><boxGeometry args={[2.3, 0.1, 0.35]} /><Mat color="#fff7ec" /></mesh>
-        <mesh position={[0, 1.42, 0.25]} rotation={[0, 0, Math.PI / 2]}><cylinderGeometry args={[0.04, 0.04, 3.2, 8]} /><Mat color="#b67a4b" /></mesh>
-        {[-1, 1].map(s => (
-          <group key={s} position={[s * 1.25, -0.05, 0.25]}>
-            {[0, 1, 2, 3].map(i => (
-              <mesh key={i} position={[s * (i * 0.13 - 0.2), 0, (i % 2) * 0.05]} castShadow><cylinderGeometry args={[0.1, 0.13, 2.9, 10]} /><Mat color="#f2a196" rough={0.95} /></mesh>
-            ))}
-          </group>
-        ))}
-      </group>
-      {sun > 0.2 && (
-        <>
-          <mesh position={[2.4, 0.015, -1.6]} rotation={[-Math.PI / 2, 0, 0]}>
-            <planeGeometry args={[3, 4.2]} />
-            <meshBasicMaterial map={radialGlow('255,205,130')} transparent opacity={0.55 * sun} blending={THREE.AdditiveBlending} depthWrite={false} toneMapped={false} />
-          </mesh>
-          <mesh position={[2.4, 1.6, -2.4]} rotation={[-0.62, 0, 0]}>
-            <planeGeometry args={[1.9, 3.6]} />
-            <meshBasicMaterial map={verticalFade('255,210,140')} transparent opacity={0.22 * sun} blending={THREE.AdditiveBlending} depthWrite={false} side={THREE.DoubleSide} toneMapped={false} />
-          </mesh>
-        </>
-      )}
-
-      {/* Kệ treo tường trái: sách, cây, ảnh */}
-      {[2.3, 3.2].map((y, si) => (
-        <group key={y} position={[-4.65, y, -1.2 + si * 0.4]}>
-          <mesh castShadow receiveShadow><boxGeometry args={[0.5, 0.09, 2.2]} /><Mat color="#b67a4b" /></mesh>
-          {[0, 1, 2, 3, 4].map(i => (
-            <mesh key={i} position={[0.02, 0.27 - (i % 2) * 0.04, -0.8 + i * 0.16]} castShadow><boxGeometry args={[0.36, 0.46 - (i % 2) * 0.08, 0.12]} /><Mat color={['#f6c453', '#8fc6c9', '#f2a3a1', '#c5b5e6', '#fff4e4'][(i + si) % 5]} /></mesh>
-          ))}
-          <group position={[0, 0.05, 0.6]}>
-            <mesh position={[0, 0.15, 0]} castShadow><cylinderGeometry args={[0.14, 0.11, 0.3, 10]} /><Mat color="#fffaf2" /></mesh>
-            <mesh position={[0, 0.38, 0]}><icosahedronGeometry args={[0.2, 0]} /><Mat flat color="#7cbf7a" /></mesh>
-          </group>
-          {si === 0 && [0, 1, 2, 3].map(i => (
-            <mesh key={i} position={[0.05, -0.25 - i * 0.22, 0.65 + (i % 2) * 0.08]}><icosahedronGeometry args={[0.13, 0]} /><Mat flat color="#88c47e" /></mesh>
-          ))}
-        </group>
-      ))}
-      {[[-2.6, 2.6, '#c5b5e6'], [-1.3, 2.9, '#f2c6a0'], [-3.6, 1.7, '#9ed1c4']].map(([x, y, art], i) => (
-        <group key={i} position={[x, y, -3.88]}>
-          <mesh><boxGeometry args={[0.8, 1, 0.06]} /><Mat color="#fffaf2" /></mesh>
-          <mesh position={[0, 0, 0.04]}><boxGeometry args={[0.6, 0.8, 0.02]} /><Mat color={art} /></mesh>
-        </group>
-      ))}
-      {/* Đồng hồ treo tường */}
-      <group position={[-4.88, 3.4, 2.3]} rotation={[0, Math.PI / 2, 0]}>
-        <mesh rotation={[Math.PI / 2, 0, 0]}><cylinderGeometry args={[0.42, 0.42, 0.08, 24]} /><Mat color="#f6c453" /></mesh>
-        <mesh position={[0, 0, 0.05]}><circleGeometry args={[0.34, 24]} /><Mat color="#fffaf2" /></mesh>
-        <mesh position={[0, 0.1, 0.07]}><boxGeometry args={[0.04, 0.22, 0.01]} /><Mat color="#4a3a30" /></mesh>
-        <mesh position={[0.08, 0, 0.07]} rotation={[0, 0, -Math.PI / 2.5]}><boxGeometry args={[0.04, 0.17, 0.01]} /><Mat color="#4a3a30" /></mesh>
-      </group>
-    </group>
-  );
-}
+// Chỗ nằm của Mochi trong nhà.
+const DOG_BED = FIXTURES.find(f => f.kind === 'dogbed');
 
 // ---------- Mô hình nội thất (mặt trước hướng +Z) ----------
 const Leg = ({ p, h = 0.2, r = 0.05, c = '#b98552' }) => <mesh position={p} castShadow><cylinderGeometry args={[r, r * 0.8, h, 8]} /><Mat color={c} /></mesh>;
@@ -237,88 +148,151 @@ export function FurnitureModel({ kind, ghost = false }) {
   return <M ghost={ghost} />;
 }
 
-// ---------- Điều khiển trong nhà: nhân vật đi tới đồ vật và thao tác ----------
+// ---------- Trong nhà: chế độ trang trí, con trỏ chuột hiện bình thường, camera nhìn từ trên xuống ----------
+// Nhân vật đi lại bằng WASD giữa các phòng, lên xuống cầu thang; đi qua cửa chính → ra đường, qua cửa sau → ra sân vườn.
+// Rê chuột lên món đồ để chọn, chuột trái nhấc lên (giữ và kéo rồi thả = kéo thả; click = nhấc lên rồi click chỗ mới để đặt),
+// chuột phải xoay. Đồ được đặt ở tầng nhân vật đang đứng.
 // held: món đang cầm — { kind } (món mới từ thanh nội thất) hoặc { kind, id } (món đã đặt được nhấc lên).
-export function Interior({ me, view, player, furniture, held, rotation, onPlace, onPick, onRotateHeld, onRotateItem, onTarget, onBlocked }) {
-  useEffect(() => { Object.assign(player.current, { x: 0, z: 3, angle: Math.PI, speed: 0 }); view.current.rYaw = null; }, [player, view]);
+const floorPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), floorHit = new THREE.Vector3(), pickRay = new THREE.Raycaster();
+export function Interior({ me, view, player, entry = 'front', furniture, held, rotation, onPlace, onPick, onRotateHeld, onRotateItem, onTarget, onBlocked, onExit, onLevel }) {
+  // useLayoutEffect: đặt vị trí xuất hiện trước khi frame đầu tiên chạy (tránh dùng toạ độ cũ còn nằm ngoài cửa).
+  useLayoutEffect(() => {
+    const s = SPAWN[entry] || SPAWN.front;
+    Object.assign(player.current, { x: s.x, z: s.z, angle: s.angle, speed: 0, y: 0, level: 0 });
+    // Chỉ khi chạy dev: cho script kiểm thử đọc / dịch chuyển nhân vật trong nhà.
+    if (import.meta.env.DEV) window.__lwHouse = player;
+  }, [player, entry]);
   const anim = useRef({ moving: false, run: false });
   const vel = useRef({ x: 0, z: 0 });
   const avatar = useRef(), ghost = useRef(), ghostRing = useRef(), targetRing = useRef();
   const spot = useRef({ x: 0, z: 0, valid: false });
-  const [target, setTarget] = useState(null);
-  const { gl } = useThree();
+  const drag = useRef(null); // { x, y, moved } khi đang giữ chuột trái sau khi nhấc đồ
+  const exited = useRef(false);
+  const [level, setLevel] = useState(0);
+  const [hover, setHover] = useState(null);
+  const hoverRef = useRef(null);
+  hoverRef.current = hover;
+  const { gl, camera } = useThree();
   const latest = useRef();
-  latest.current = { furniture, held, rotation, target, onPlace, onPick, onRotateHeld, onRotateItem, onBlocked };
+  latest.current = { furniture, held, rotation, level, onPlace, onPick, onRotateHeld, onRotateItem, onBlocked, onExit };
+  const keys = useKeys();
 
-  useEffect(() => { onTarget?.(target); }, [target, onTarget]);
-  useEffect(() => { if (held) setTarget(null); }, [held]);
+  useEffect(() => { onTarget?.(hover); }, [hover, onTarget]);
+  useEffect(() => { onLevel?.(level); }, [level, onLevel]);
+  useEffect(() => { if (held) setHover(null); }, [held]);
+  // Đổi tầng → bỏ chọn món ở tầng cũ.
+  useEffect(() => { setHover(null); }, [level]);
+  // Món đang chọn được xoay / cập nhật → lấy bản mới nhất.
+  useEffect(() => { setHover(h => (h ? furniture.find(f => f.id === h.id) || null : h)); }, [furniture]);
 
-  // Chuột trái: nhấc / đặt. Chuột phải: xoay.
-  const keys = useWalkControls(gl, view, button => {
-    const L = latest.current;
-    if (button === 0) {
-      if (L.held) { if (spot.current.valid) L.onPlace({ x: spot.current.x, z: spot.current.z }); else L.onBlocked?.(); }
-      else if (L.target) L.onPick(L.target);
-    } else if (button === 2) {
-      if (L.held) L.onRotateHeld(); else if (L.target) L.onRotateItem(L.target);
-    }
+  useEffect(() => {
+    const el = gl.domElement;
+    const tryPlace = () => {
+      const L = latest.current, s = spot.current;
+      if (!L.held) return;
+      if (s.valid) L.onPlace({ x: s.x, z: s.z, floor: L.level }); else L.onBlocked?.();
+    };
+    const pdown = e => {
+      const L = latest.current;
+      // Đang ngắm cảnh (chuột bị khoá) thì không thao tác đồ đạc.
+      if (document.pointerLockElement) return;
+      if (e.button === 0 && L.held && !drag.current) tryPlace();
+      else if (e.button === 2) { if (L.held) L.onRotateHeld(); else if (hoverRef.current) L.onRotateItem(hoverRef.current); }
+    };
+    const pmove = e => { const d = drag.current; if (d && Math.hypot(e.clientX - d.x, e.clientY - d.y) > 6) d.moved = true; };
+    // Thả chuột sau khi đã kéo → đặt món đồ tại chỗ thả.
+    const pup = e => { const d = drag.current; if (e.button !== 0 || !d) return; drag.current = null; if (d.moved) tryPlace(); };
+    const ctx = e => e.preventDefault();
+    el.addEventListener('pointerdown', pdown); el.addEventListener('contextmenu', ctx);
+    window.addEventListener('pointermove', pmove); window.addEventListener('pointerup', pup);
+    return () => {
+      el.removeEventListener('pointerdown', pdown); el.removeEventListener('contextmenu', ctx);
+      window.removeEventListener('pointermove', pmove); window.removeEventListener('pointerup', pup);
+      el.style.cursor = '';
+    };
+  }, [gl]);
+
+  // Sự kiện R3F trên từng món đồ ở tầng đang đứng (raycast đúng hình dạng 3D, kể cả đồ cao như tủ sách).
+  const itemEvents = item => ({
+    onPointerOver: e => { e.stopPropagation(); if (!latest.current.held && !document.pointerLockElement) setHover(item); },
+    onPointerOut: () => setHover(h => (h?.id === item.id ? null : h)),
+    onPointerDown: e => {
+      if (e.button !== 0 || latest.current.held || document.pointerLockElement) return;
+      e.stopPropagation();
+      drag.current = { x: e.nativeEvent.clientX, y: e.nativeEvent.clientY, moved: false };
+      latest.current.onPick(item);
+    },
   });
 
-  useFrame((_, rawDt) => {
-    const dt = Math.min(rawDt, 0.06), p = player.current, v = vel.current, k = keys.current;
+  useFrame((state, rawDt) => {
+    const dt = Math.min(rawDt, 0.06), p = player.current, v = vel.current;
     const L = latest.current;
-    const boxes = L.furniture.filter(f => f.id !== L.held?.id).map(f => ({ f, ...boxOf(f) }));
-    // ---- Di chuyển có quán tính, bị chặn bởi tường và đồ đạc (trừ thảm) ----
-    stepWalker({ p, v, k, view, dt, anim, walk: WALK, hit: (x, z) => boxes.some(b => !b.rug && rectDist(x, z, b) < PLAYER_R) });
-    avatar.current?.position.set(p.x, 0, p.z);
+    if (p.y == null) { p.y = 0; p.level = 0; }
+    const all = L.furniture.filter(f => f.id !== L.held?.id).map(f => ({ f, fl: floorOf(f), ...boxOf(f) }));
+    const furnHit = (l, x, z) => all.some(b => b.fl === l && !b.rug && rectDist(x, z, b) < PLAYER_R);
+    // Đang kẹt sẵn trong đồ đạc (vd. vừa đặt đồ lên chỗ đứng) thì bỏ qua đồ đạc để bước ra.
+    const stuck = furnHit(p.level, p.x, p.z);
+    // ---- Đi lại: chỉ bước tới chỗ có mặt sàn / bậc thang cao gần bằng chỗ đang đứng, không xuyên tường, đồ cố định, đồ đạc ----
+    const hit = (x, z) => {
+      const s = surfaceAt(x, z, p.y);
+      if (!s) return true;
+      return structureHit(s.level, x, z, PLAYER_R) || (!stuck && furnHit(s.level, x, z));
+    };
+    // Ngắm cảnh trên sân thượng: WASD đi theo hướng camera.
+    stepWalker({ p, v, k: keys.current, yaw: view?.current.tp ? view.current.roomLook.yaw : null, dt, anim, walk: WALK, hit });
+    const s = surfaceAt(p.x, p.z, p.y);
+    if (s) { p.y = s.y; p.level = s.level; }
+    avatar.current?.position.set(p.x, p.y, p.z);
     if (avatar.current) avatar.current.rotation.y = p.angle;
-    const dx = Math.sin(p.angle), dz = Math.cos(p.angle);
+    if (p.level !== L.level) setLevel(p.level);
+    // ---- Đi qua cửa: cửa chính → ra đường, cửa sau → ra sân vườn ----
+    if (!exited.current && p.level === 0) {
+      // Chỉ tính khi đang bước ra phía ngoài cửa.
+      const out = p.z > DOORS.front.z + 0.25 && v.z > 0 ? 'world' : p.z < DOORS.back.z - 0.25 && v.z < 0 ? 'garden' : null;
+      if (out) { exited.current = true; L.onExit?.(out); }
+    }
+
+    const cursor = L.held ? (drag.current ? 'grabbing' : 'move') : hoverRef.current ? 'grab' : 'default';
+    if (gl.domElement.style.cursor !== cursor) gl.domElement.style.cursor = cursor;
 
     if (L.held) {
-      // ---- Đang cầm đồ: vị trí đặt là ô lưới ngay trước mặt ----
+      // ---- Đang cầm đồ: món đồ bám theo con trỏ trên sàn tầng hiện tại, khớp lưới 0.5 m ----
+      floorPlane.constant = -levelY(L.level);
+      pickRay.setFromCamera(state.pointer, camera);
+      if (!pickRay.ray.intersectPlane(floorPlane, floorHit)) return;
       const fp = footprint(L.held.kind, L.rotation);
-      const reach = 0.45 + Math.abs(dx) * fp.hw + Math.abs(dz) * fp.hd;
-      const sx = clamp(Math.round((p.x + dx * reach) * 2) / 2, Math.max(-LIMIT.x, WALL.x0 + fp.hw), Math.min(LIMIT.x, WALL.x1 - fp.hw));
-      const sz = clamp(Math.round((p.z + dz * reach) * 2) / 2, Math.max(-LIMIT.z, WALL.z0 + fp.hd), Math.min(LIMIT.z, WALL.z1 - fp.hd));
+      const sx = Math.round(floorHit.x * 2) / 2, sz = Math.round(floorHit.z * 2) / 2;
       const box = { x: sx, z: sz, ...fp, rug: L.held.kind === 'rug' };
-      const valid = !boxes.some(b => b.rug === box.rug && overlap(box, b)) && (box.rug || rectDist(p.x, p.z, box) > PLAYER_R - 0.05);
+      const valid = placementOk(L.level, box, box.rug) && !all.some(b => b.fl === L.level && b.rug === box.rug && overlap(box, b));
       spot.current = { x: sx, z: sz, valid };
-      if (ghost.current) { ghost.current.position.set(sx, 0, sz); ghost.current.rotation.y = L.rotation; }
+      if (ghost.current) { ghost.current.position.set(sx, levelY(L.level), sz); ghost.current.rotation.y = L.rotation; }
       ghostRing.current?.material.color.set(valid ? '#5fbfae' : '#f2727a');
       if (targetRing.current) targetRing.current.visible = false;
       return;
     }
-    // ---- Tay không: tìm món đồ gần nhất ở trước mặt ----
-    let best = null, bestScore = 1.1;
-    for (const b of boxes) {
-      const d = rectDist(p.x, p.z, b);
-      if (d > 0.9) continue;
-      const tx = b.x - p.x, tz = b.z - p.z, tl = Math.hypot(tx, tz) || 1;
-      const facing = (tx * dx + tz * dz) / tl;
-      if (facing < -0.25 && d > 0.05) continue;
-      const score = d - facing * 0.35 + (b.rug ? 0.7 : 0);
-      if (score < bestScore) { bestScore = score; best = b; }
-    }
-    if ((best?.f.id ?? null) !== (L.target?.id ?? null)) setTarget(best ? best.f : null);
+    // ---- Tay không: khung vuông quanh món đồ đang rê chuột ----
+    const h = hoverRef.current, b = h && boxOf(h);
     if (targetRing.current) {
-      targetRing.current.visible = !!best;
-      if (best) {
-        targetRing.current.position.set(best.x, 0.04, best.z);
-        targetRing.current.scale.set(best.hw + 0.2, best.hd + 0.2, 1);
-      }
+      targetRing.current.visible = !!b;
+      if (b) { targetRing.current.position.set(b.x, levelY(floorOf(h)) + 0.04, b.z); targetRing.current.scale.set(b.hw + 0.2, b.hd + 0.2, 1); }
     }
   });
 
   return (
     <group>
-      <Room />
-      {furniture.filter(item => item.id !== held?.id).map(item => (
-        <group key={item.id} position={[Number(item.pos_x), 0, Number(item.pos_z)]} rotation={[0, Number(item.rotation_y || 0), 0]} scale={target?.id === item.id ? 1.05 : 1}>
-          <FurnitureModel kind={item.kind} />
-        </group>
-      ))}
-      {/* Khung vuông đánh dấu món đồ có thể thao tác */}
-      <mesh ref={targetRing} geometry={squareRing} rotation={[-Math.PI / 2, 0, 0]} visible={false}>
+      <House level={level} />
+      {/* Đồ ở tầng trên tầng đang đứng bị ẩn; chỉ đồ ở tầng hiện tại mới chọn được */}
+      {furniture.filter(item => item.id !== held?.id && floorOf(item) <= level).map(item => {
+        const here = floorOf(item) === level;
+        return (
+          <group key={item.id} position={[Number(item.pos_x), levelY(floorOf(item)), Number(item.pos_z)]} rotation={[0, Number(item.rotation_y || 0), 0]}
+            scale={hover?.id === item.id ? 1.05 : 1} {...(here ? itemEvents(item) : {})}>
+            <FurnitureModel kind={item.kind} />
+          </group>
+        );
+      })}
+      {/* Khung vuông đánh dấu món đồ đang chọn */}
+      <mesh ref={targetRing} geometry={squareRing} rotation={[-Math.PI / 2, 0, 0]} visible={false} raycast={() => null}>
         <meshBasicMaterial color="#5fbfae" transparent opacity={0.9} depthWrite={false} />
       </mesh>
       {held && (
@@ -327,10 +301,13 @@ export function Interior({ me, view, player, furniture, held, rotation, onPlace,
           <mesh ref={ghostRing} position={[0, 0.03, 0]} rotation={[-Math.PI / 2, 0, 0]}><ringGeometry args={[0.85, 1, 32]} /><meshBasicMaterial color="#5fbfae" transparent opacity={0.8} depthWrite={false} /></mesh>
         </group>
       )}
-      <group ref={avatar} position={[0, 0, 3]} rotation={[0, Math.PI, 0]}>
+      <group ref={avatar}>
         <Avatar anim={anim} shirt={shirtColor(me?.id)} hair={hairColor(me?.id)} name={me?.display_name} />
       </group>
-      <Puppy player={player} bounds={WALK} />
+      {/* Mochi nằm chờ trên ổ của mình ở phòng khách */}
+      <Puppy position={[DOG_BED.x, 0.12, DOG_BED.z]} rotation={-0.6} />
     </group>
   );
 }
+
+export { LEVEL_NAME, roomOf };
